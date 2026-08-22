@@ -1,17 +1,14 @@
 import os
-import json
-from typing import List, Dict, Any, Optional
+import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from google import genai
-from supabase import create_client, Client
 
-app = FastAPI(
-    title="MetaPrompt Orchestrator Core API",
-    description="Autonomous meta-prompting & schema reflection engine powered by Gemini 2.5 Flash",
-    version="1.0.0"
-)
+app = FastAPI()
+start_time = time.time()
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,144 +18,168 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
-supabase_client: Optional[Client] = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+# --- MEMORY STORES FOR CONVERSATIONS ---
+social_chats = {}
+code_chats = {}
+canvas_chats = {}
 
-class PromptOptimizationRequest(BaseModel):
-    system_instruction: str = Field(..., description="Initial raw system prompt draft")
-    user_input: str = Field(..., description="Sample user query or context payload")
-    target_schema: Dict[str, Any] = Field(..., description="Expected JSON Schema structure")
-    max_iterations: int = Field(default=3, ge=1, le=5)
-    benchmark_threshold: float = Field(default=90.0, ge=0.0, le=100.0)
+# --- MULTI-MODEL FALLBACK CASCADE ---
+# Uses official, active Gemini API models in order of priority
+MODEL_CASCADE = [
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b"
+]
 
-class OptimizationResponse(BaseModel):
-    optimized_prompt: str
-    final_output: str
-    quality_score: float
-    iterations_used: int
-    model_used: str
-    improvement_percentage: float
+class PostRequest(BaseModel):
+    session_id: str
+    topic: str
+    platform: str
+    tone: str
+    edit_instruction: str = ""
 
-def generate_text_with_fallback(prompt: str, user_input: str) -> tuple[str, str]:
-    model_cascade = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
-    last_exception = None
+class CodeRequest(BaseModel):
+    session_id: str
+    code: str
+    edit_instruction: str = ""
+
+class ChatRequest(BaseModel):
+    session_id: str = "default_canvas"
+    message: str
+
+
+def send_chat_with_fallback(chat_store: dict, session_id: str, prompt: str):
+    """
+    Sends a message to an active chat session.
+    If rate-limited (429), overloaded (503), or unavailable (404),
+    cascades through candidate models while retaining history.
+    """
+    history = []
     
-    for model_name in model_cascade:
+    # Check if an active session exists
+    if session_id in chat_store:
+        current_model = chat_store[session_id]["model"]
         try:
-            response = gemini_client.models.generate_content(
-                model=model_name,
-                contents=f"System Instruction: {prompt}\n\nUser Input: {user_input}"
-            )
-            if response.text:
-                return response.text, model_name
+            return chat_store[session_id]["chat"].send_message(prompt)
         except Exception as e:
-            last_exception = e
-            continue
+            print(f"[Warning] Model '{current_model}' failed ({e}). Extracting history for fallback...")
+            try:
+                history = chat_store[session_id]["chat"].get_history()
+            except Exception:
+                history = []
             
-    raise HTTPException(status_code=503, detail=f"All Gemini models in cascade failed: {str(last_exception)}")
+            # Resume searching candidate models right after the failed model
+            start_index = MODEL_CASCADE.index(current_model) + 1 if current_model in MODEL_CASCADE else 0
+    else:
+        start_index = 0
 
-def evaluate_quality(output: str, target_schema: Dict[str, Any]) -> tuple[float, str]:
-    try:
-        parsed_json = json.loads(output.strip().strip("```json").strip("```"))
-        missing_keys = [k for k in target_schema.keys() if k not in parsed_json]
-        if missing_keys:
-            return 60.0, f"Missing required keys in response schema: {missing_keys}"
-        return 95.0, "JSON schema validation passed without errors."
-    except json.JSONDecodeError as e:
-        return 30.0, f"Invalid JSON format produced: {str(e)}"
-
-def get_text_embedding(text: str) -> List[float]:
-    try:
-        response = gemini_client.models.embed_content(
-            model="text-embedding-004",
-            contents=text
-        )
-        return response.embeddings[0].values
-    except Exception:
-        return [0.0] * 768
-
-@app.post("/api/optimize", response_model=OptimizationResponse)
-async def optimize_prompt(req: PromptOptimizationRequest):
-    if not gemini_client:
-        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is missing.")
-
-    current_prompt = req.system_instruction
-    baseline_score = 0.0
-    final_score = 0.0
-    final_output = ""
-    model_used = "gemini-2.5-flash"
-    
-    for iteration in range(1, req.max_iterations + 1):
-        output_text, used_model = generate_text_with_fallback(current_prompt, req.user_input)
-        final_output = output_text
-        model_used = used_model
-        
-        score, error_log = evaluate_quality(output_text, req.target_schema)
-        if iteration == 1:
-            baseline_score = score
-        final_score = score
-
-        if score >= req.benchmark_threshold:
-            break
-
-        meta_prompt = f"""
-[SYSTEM INSTRUCTION: META-PROMPT OPTIMIZER]
-You are an expert prompt engineer. Analyze the input prompt, target schema, and output error log.
-Rewrite the prompt using Role-Task-Format constraints and dynamic variable tags to eliminate ambiguity and force valid JSON.
-
-ORIGINAL PROMPT:
-{current_prompt}
-
-TARGET SCHEMA REQUIREMENT:
-{json.dumps(req.target_schema, indent=2)}
-
-FAILED OUTPUT:
-{output_text}
-
-VALIDATION ERROR LOG:
-{error_log}
-
-TASK: Return ONLY the raw improved system prompt without markdown wrappers or meta-commentary.
-"""
-        reflection_res = gemini_client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=meta_prompt
-        )
-        current_prompt = reflection_res.text.strip()
-
-    improvement = max(0.0, ((final_score - baseline_score) / (baseline_score if baseline_score > 0 else 1)) * 100)
-
-    if supabase_client:
+    # Iterate through fallback models
+    for model_name in MODEL_CASCADE[start_index:]:
         try:
-            prompt_embed = get_text_embedding(current_prompt)
-            output_embed = get_text_embedding(final_output)
-            supabase_client.table("prompt_benchmark_runs").insert({
-                "baseline_prompt": req.system_instruction,
-                "optimized_prompt": current_prompt,
-                "sample_input": req.user_input,
-                "output_text": final_output,
-                "quality_score": final_score,
-                "iterations_count": iteration,
-                "model_used": model_used,
-                "prompt_embedding": prompt_embed,
-                "output_embedding": output_embed
-            }).execute()
-        except Exception as e:
-            print(f"Supabase persistence error: {e}")
+            print(f"[Fallback Active] Initializing session '{session_id}' with '{model_name}'...")
+            new_chat = client.chats.create(model=model_name, history=history)
+            response = new_chat.send_message(prompt)
+            
+            # Store updated chat instance and active model
+            chat_store[session_id] = {
+                "chat": new_chat,
+                "model": model_name
+            }
+            return response
+        except Exception as err:
+            print(f"[Warning] '{model_name}' failed ({err}). Cascading to next candidate...")
 
-    return OptimizationResponse(
-        optimized_prompt=current_prompt,
-        final_output=final_output,
-        quality_score=final_score,
-        iterations_used=iteration,
-        model_used=model_used,
-        improvement_percentage=round(improvement, 2)
+    raise HTTPException(
+        status_code=500,
+        detail="All configured Gemini fallback models hit rate limits or failed."
     )
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+# --- API ROUTES ---
+
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "Operational",
+        "uptime": time.time() - start_time
+    }
+
+
+@app.post("/api/chat")
+def general_chat(req: ChatRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY environment variable is missing.")
+    
+    response = send_chat_with_fallback(canvas_chats, req.session_id, req.message)
+    active_model = canvas_chats[req.session_id]["model"]
+    return {
+        "reply": response.text.strip(),
+        "model_used": active_model
+    }
+
+
+@app.post("/api/generate")
+def generate_post(req: PostRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing.")
+    
+    s_id = req.session_id
+
+    if s_id not in social_chats:
+        prompt = (
+            f"You are an expert social media manager. Write a complete, ready-to-publish {req.platform} post.\n"
+            f"Topic: {req.topic}\n"
+            f"Tone: {req.tone}\n\n"
+            f"Format rules:\n"
+            f"- Format specifically for {req.platform} (include line breaks, emojis, and relevant hashtags).\n"
+            f"- Do NOT include conversational intros."
+        )
+    else:
+        prompt = (
+            f"Modify the social media post according to these new user editing instructions: '{req.edit_instruction}'.\n"
+            f"Maintain the core theme layout constraints for {req.platform} and keep a {req.tone} voice profile."
+        )
+
+    response = send_chat_with_fallback(social_chats, s_id, prompt)
+    return {"post": response.text.strip()}
+
+
+@app.post("/api/correct-code")
+def correct_python_code(req: CodeRequest):
+    if not client:
+        raise HTTPException(status_code=500, detail="GEMINI_API_KEY missing.")
+    
+    s_id = req.session_id
+
+    if s_id not in code_chats:
+        prompt = (
+            "You are an elite Python compiler and debugging assistant. Analyze the following broken Python code:\n\n"
+            f"```python\n{req.code}\n```\n\n"
+            "Provide your response exactly in this format:\n"
+            "1. FIXED CODE: Provide the complete, fully corrected clean code block inside a code fence.\n"
+            "2. WHAT WAS WRONG: A brief bulleted summary explaining the bugs you fixed."
+        )
+    else:
+        prompt = (
+            f"Apply the following new modifications or feature additions to the previous code workspace: '{req.edit_instruction}'.\n"
+            "Return the full complete code file block along with a description summary of the changes."
+        )
+
+    response = send_chat_with_fallback(code_chats, s_id, prompt)
+    return {"fixed_explanation": response.text.strip()}
+
+
+# --- STATIC DASHBOARD MOUNTING ---
+DASHBOARD_DIR = os.path.abspath("artifacts/echo-dashboard")
+
+@app.get("/")
+def serve_index():
+    if os.path.exists(os.path.join(DASHBOARD_DIR, "index.html")):
+        return FileResponse(os.path.join(DASHBOARD_DIR, "index.html"))
+    return {"status": "Backend running. Dashboard static files not found."}
+
+if os.path.exists(DASHBOARD_DIR):
+    app.mount("/", StaticFiles(directory=DASHBOARD_DIR, html=True), name="static")
